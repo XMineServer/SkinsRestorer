@@ -47,17 +47,33 @@ setupSRSubproject("bukkit")
 setupSRSubproject("bungee")
 setupSRSubproject("velocity")
 
-setupSubproject("skinsrestorer-mod-common") {
-    projectDir = file("mod/common")
-}
+// XMine start - модовые подпроекты можно выключить
+//
+// Fabric и NeoForge в универсальный SkinsRestorer.jar не входят вовсе: universal
+// собирается из bukkit, bungee, velocity и miniplaceholders. Зато их плагины на
+// стадии КОНФИГУРАЦИИ скачивают, патчат и декомпилируют Minecraft - это десятки
+// минут на каждом холодном прогоне, то есть на каждом запуске CI.
+//
+// По умолчанию поведение апстримное; -PxmineSkipMods=true отключает три
+// подпроекта, на которые никто за пределами mod/ не ссылается.
+val xmineSkipMods = providers.gradleProperty("xmineSkipMods")
+    .map(String::toBoolean)
+    .getOrElse(false)
 
-setupSubproject("skinsrestorer-mod-fabric") {
-    projectDir = file("mod/fabric")
-}
+if (!xmineSkipMods) {
+    setupSubproject("skinsrestorer-mod-common") {
+        projectDir = file("mod/common")
+    }
 
-setupSubproject("skinsrestorer-mod-neoforge") {
-    projectDir = file("mod/neoforge")
+    setupSubproject("skinsrestorer-mod-fabric") {
+        projectDir = file("mod/fabric")
+    }
+
+    setupSubproject("skinsrestorer-mod-neoforge") {
+        projectDir = file("mod/neoforge")
+    }
 }
+// XMine end - модовые подпроекты можно выключить
 
 setupSubproject("skinsrestorer") {
     projectDir = file("universal")

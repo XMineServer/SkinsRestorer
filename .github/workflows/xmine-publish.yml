@@ -1,0 +1,89 @@
+# Публикация форка SkinsRestorer в свой Reposilite.
+#
+# ЭТОТ РЕПОЗИТОРИЙ ПУБЛИЧНЫЙ, поэтому `runs-on` здесь — только раннеры GitHub и
+# никогда `self-hosted`. Правило записано в вики (infra/ci.md, «Граница
+# безопасности: только приватные репозитории»), и обе группы раннеров
+# организации имеют `allows_public_repositories=false`. Причина в том, что PR из
+# чужого форка исполняет workflow ИЗ САМОГО PR, то есть автор форка волен
+# дописать `runs-on: self-hosted` и получить исполнение своего кода на хосте, где
+# работает игровой сервер. У `XMineServer/Paper` тот же комментарий и та же
+# причина.
+#
+# Отсюда же остальные меры: триггера `pull_request` нет вовсе, push ограничен
+# нашими ветками, а job не запускается в форках самого форка.
+
+name: XMine - publish SkinsRestorer
+
+on:
+  push:
+    branches: ['xmine/**']
+  workflow_dispatch:
+
+# Публикация не должна идти в два потока: параллельные сборки означали бы гонку
+# за то, чья попадёт под координату.
+concurrency:
+  group: xmine-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # Форки самого форка не должны пытаться публиковать в наш Reposilite.
+    if: github.repository == 'XMineServer/SkinsRestorer'
+    runs-on: ubuntu-latest
+
+    env:
+      XMINE_MAVEN_USERNAME: ${{ secrets.XMINE_MAVEN_USERNAME }}
+      XMINE_MAVEN_PASSWORD: ${{ secrets.XMINE_MAVEN_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: 25
+          distribution: 'zulu'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Fail early without credentials
+        run: |
+          # Без учётки сборка дошла бы до конца и упала на последнем шаге.
+          # Дешевле проверить сразу.
+          if [ -z "${XMINE_MAVEN_USERNAME:-}" ] || [ -z "${XMINE_MAVEN_PASSWORD:-}" ]; then
+            echo "::error::Secrets XMINE_MAVEN_USERNAME / XMINE_MAVEN_PASSWORD are not set"
+            exit 1
+          fi
+
+      - name: Test
+        # Только свои тесты. Остальной набор в этом модуле поднимает MariaDB и
+        # PostgreSQL через testcontainers - это не то, что должно решать, публикуем
+        # ли мы плагин, и не то, что стоит держать в зависимости от чужого Docker Hub.
+        #
+        # EnvConfigTest - единственное, что отделяет сломанный конфиг от публикации:
+        # он проверяет и подстановку !ENV, и то, что конфиг не переписывается
+        # разрешёнными значениями (пароль открытым текстом на диск).
+        run: ./gradlew -PxmineSkipMods=true :test:test --tests 'net.skinsrestorer.config.*' --stacktrace
+
+      - name: Build universal jar
+        # Тот самый один-на-все-платформы SkinsRestorer.jar, который едет на прокси.
+        run: ./gradlew -PxmineSkipMods=true :skinsrestorer:shadeDowngradedApi --stacktrace
+
+      - name: Publish
+        run: ./gradlew -PxmineSkipMods=true :skinsrestorer:publishXmineUniversalPublicationToXmineRepository --stacktrace
+
+      - name: Report coordinate
+        run: |
+          VERSION="$(./gradlew -q --console=plain -PxmineSkipMods=true :skinsrestorer:printXmineVersion | tail -1)"
+          SHA="$(sha256sum build/libs/SkinsRestorer.jar | cut -d' ' -f1)"
+          {
+            echo "### Published"
+            echo '```'
+            echo "ru.xmine.thirdparty:skinsrestorer:$VERSION"
+            echo "sha256: $SHA"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

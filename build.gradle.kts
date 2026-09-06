@@ -10,7 +10,16 @@ tasks.named<UpdateDaemonJvm>("updateDaemonJvm") {
 
 allprojects {
     group = "net.skinsrestorer"
-    version = property("maven_version")!!
+    // XMine start - своя версия
+    //
+    // Суффикс -xmine не косметика: наш jar лежит в своём Reposilite и по внешнему
+    // виду неотличим от апстримного. Версия - единственное, что говорит, какая
+    // сборка стоит на прокси, и она же видна в /sr info и в логе запуска.
+    //
+    // Апстримному апдейт-чекеру суффикс не мешает: SemanticVersion.fromString
+    // обрезает строку на первом не-цифре и не-точке, то есть видит ровно 15.12.5.
+    version = "${property("maven_version")}-xmine.${property("xmineBuild")}"
+    // XMine end - своя версия
     description = "Ability to restore/change skins on servers!"
 
     repositories {

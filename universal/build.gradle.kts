@@ -2,6 +2,9 @@ import io.papermc.hangarpublishplugin.model.Platforms
 
 plugins {
     java
+    // XMine start - публикация универсального jar в свой Reposilite
+    `maven-publish`
+    // XMine end - публикация универсального jar в свой Reposilite
     id("xyz.wagyourtail.jvmdowngrader")
     id("io.papermc.hangar-publish-plugin") version "0.1.4"
 }
@@ -80,3 +83,77 @@ hangarPublish {
         }
     }
 }
+
+// XMine start - публикация универсального jar в свой Reposilite
+//
+// Публикуется ровно тот файл, который у нас едет на прокси: build/libs/SkinsRestorer.jar,
+// один на все платформы. Подпроектные публикации из sr.base-logic (api, shared, ...) нас
+// не касаются - мы их не заливаем.
+//
+// Раздел жёстко third-party: это зеркало чужих плагинов, и наш форк лежит там же, рядом
+// с апстримным skinsrestorer:15.12.5, отличаясь только версией.
+publishing {
+    publications {
+        register<MavenPublication>("xmineUniversal") {
+            groupId = "ru.xmine.thirdparty"
+            artifactId = "skinsrestorer"
+            version = project.version.toString()
+
+            artifact(tasks.shadeDowngradedApi.flatMap { it.archiveFile }) {
+                // archiveFileName у задачи переопределён на SkinsRestorer.jar, но классификатор
+                // задачи от этого не исчезает - без явного сброса он уехал бы в координату.
+                classifier = null
+                extension = "jar"
+            }
+
+            pom {
+                name = "SkinsRestorer (XMine fork)"
+                description = "SkinsRestorer with environment variable expansion in config.yml"
+                url = "https://github.com/XMineServer/SkinsRestorer"
+                licenses {
+                    license {
+                        name = "GNU General Public License v3.0"
+                        url = "https://www.gnu.org/licenses/gpl-3.0.html"
+                    }
+                }
+                scm {
+                    connection = "scm:git:https://github.com/XMineServer/SkinsRestorer.git"
+                    url = "https://github.com/XMineServer/SkinsRestorer"
+                }
+            }
+        }
+    }
+
+    repositories {
+        // Имена свойств учётки - те же, что у остальных проектов XMine (Paper, XMinePlugins):
+        // локально ~/.gradle/gradle.properties, в CI - переменные окружения.
+        maven {
+            name = "xmine"
+            val base = providers.gradleProperty("xmineMavenUrl")
+                .getOrElse("https://maven.xmine.world")
+            url = uri("$base/third-party")
+            credentials {
+                username = providers.gradleProperty("xmineMavenUsername")
+                    .orElse(providers.environmentVariable("XMINE_MAVEN_USERNAME"))
+                    .orNull
+                password = providers.gradleProperty("xmineMavenPassword")
+                    .orElse(providers.environmentVariable("XMINE_MAVEN_PASSWORD"))
+                    .orNull
+            }
+        }
+    }
+}
+
+// Публикация берёт готовый файл, а не выход компонента, поэтому связь с задачей,
+// которая этот файл делает, объявляется здесь явно.
+tasks.withType<AbstractPublishToMaven>().configureEach {
+    dependsOn(tasks.shadeDowngradedApi)
+}
+
+tasks.register("printXmineVersion") {
+    val v = project.version.toString()
+    doLast {
+        println(v)
+    }
+}
+// XMine end - публикация универсального jar в свой Reposilite
