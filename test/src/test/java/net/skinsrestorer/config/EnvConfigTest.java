@@ -19,11 +19,10 @@ package net.skinsrestorer.config;
 
 import ch.jalu.configme.SettingsManager;
 import ch.jalu.configme.SettingsManagerBuilder;
-import ch.jalu.configme.exception.ConfigMeException;
 import ch.jalu.configme.migration.PlainMigrationService;
 import net.skinsrestorer.shared.config.DatabaseConfig;
 import net.skinsrestorer.shared.config.EnvYamlFileResource;
-import net.skinsrestorer.shared.config.StrictEnvScalarConstructor;
+import net.skinsrestorer.shared.config.EnvironmentSubstitutor;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -33,16 +32,20 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.UnaryOperator;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 // XMine start - подстановка переменных окружения в config.yml
 /**
- * Guards the two things the XMine fork adds to config loading: {@code !ENV} expansion, and the
- * refusal to overwrite an existing config file.
+ * Guards the two things the XMine fork adds to config loading: environment variable expansion, and
+ * the refusal to overwrite an existing config file.
+ *
+ * <p>The expansion rules are the XMine Paper fork's, ported in {@link EnvironmentSubstitutor}: no
+ * tag, nested fallbacks, and a type that follows the quoting.
  *
  * <p>The environment variables these tests read are set by the {@code test} task, see
  * {@code test/build.gradle.kts}.
@@ -53,17 +56,18 @@ class EnvConfigTest {
     private static final String PASSWORD = System.getenv("SR_TEST_PASSWORD");
 
     /** Every key DatabaseConfig knows about, so nothing is missing from the resource. */
-    private static final String COMPLETE_CONFIG =
-            "database:\n"
-                    + "    type: MYSQL\n"
-                    + "    host: !ENV ${SR_TEST_HOST}\n"
-                    + "    port: 3306\n"
-                    + "    database: !ENV ${SR_TEST_DATABASE}\n"
-                    + "    username: !ENV ${SR_TEST_USERNAME}\n"
-                    + "    password: !ENV ${SR_TEST_PASSWORD}\n"
-                    + "    maxPoolSize: 10\n"
-                    + "    tablePrefix: 'sr_'\n"
-                    + "    connectionOptions: 'sslMode=trust&serverTimezone=UTC'\n";
+    private static final String COMPLETE_CONFIG = """
+            database:
+                type: MYSQL
+                host: ${SR_TEST_HOST}
+                port: 3306
+                database: ${SR_TEST_DATABASE}
+                username: ${SR_TEST_USERNAME}
+                password: ${SR_TEST_PASSWORD}
+                maxPoolSize: 10
+                tablePrefix: 'sr_'
+                connectionOptions: 'sslMode=trust&serverTimezone=UTC'
+            """;
 
     @Test
     void expandsEnvVariablesAndLeavesTheFileAlone(@TempDir Path dir) throws IOException {
@@ -82,7 +86,7 @@ class EnvConfigTest {
      * The case this fork exists to prevent. A key missing from the file — which is what a plugin
      * upgrade looks like — makes ConfigMe report a migration, and stock ConfigMe answers that by
      * rewriting the whole file from the resolved in-memory values. That would put the database
-     * password on disk in plain text and drop the {@code !ENV} tags with it.
+     * password on disk in plain text and lose every {@code ${...}} reference with it.
      */
     @Test
     void doesNotRewriteTheConfigWhenAKeyIsMissing(@TempDir Path dir) throws IOException {
@@ -101,33 +105,66 @@ class EnvConfigTest {
     }
 
     /**
-     * An {@code !ENV} scalar is always a String, and ConfigMe accepts a String only for string and
-     * enum properties. Feeding an int property from the environment therefore silently loses the
-     * value — the test states that limitation rather than pretending it does not exist.
+     * The reason this fork stopped using SnakeYAML's {@code !ENV}: that tag always produced a
+     * String, ConfigMe took a String only for string and enum properties, and an int fed from the
+     * environment was silently lost — which is what forced {@code database.port} to be a literal,
+     * and a literal port is what made the node image fit one contour only.
+     *
+     * <p>Substitution now runs on the node tree, so an unquoted reference is retyped and arrives
+     * as the number it expands to.
      */
     @Test
-    void envOnANumericPropertyIsIgnoredButStillDoesNotRewrite(@TempDir Path dir) throws IOException {
-        String numericFromEnv = COMPLETE_CONFIG.replace("    port: 3306\n", "    port: !ENV ${SR_TEST_PORT}\n");
+    void unquotedNumericReferenceArrivesAsANumber(@TempDir Path dir) throws IOException {
+        String numericFromEnv = COMPLETE_CONFIG.replace("    port: 3306\n", "    port: ${SR_TEST_PORT}\n");
         Path config = write(dir, numericFromEnv);
+        List<String> warnings = new ArrayList<>();
+
+        SettingsManager settings = load(config, warnings);
+
+        assertEquals(3307, settings.getProperty(DatabaseConfig.DATABASE_PORT),
+                "an unquoted reference must reach an int property");
+        assertEquals(numericFromEnv, read(config), "and still no rewrite");
+        assertTrue(warnings.isEmpty(), "nothing to warn about: " + warnings);
+    }
+
+    /** The other half of that rule: quoting asks for a string, and a string it stays. */
+    @Test
+    void quotedNumericReferenceStaysAString(@TempDir Path dir) throws IOException {
+        String quoted = COMPLETE_CONFIG.replace("    port: 3306\n", "    port: \"${SR_TEST_PORT}\"\n");
+        Path config = write(dir, quoted);
         List<String> warnings = new ArrayList<>();
 
         SettingsManager settings = load(config, warnings);
 
         assertEquals(3306, settings.getProperty(DatabaseConfig.DATABASE_PORT),
                 "a String where an Integer is expected falls back to the default");
-        assertEquals(numericFromEnv, read(config), "and still no rewrite");
-        assertEquals(1, warnings.size());
+        assertEquals(quoted, read(config), "and still no rewrite");
+        assertEquals(1, warnings.size(), "the suppressed write must be reported");
     }
 
+    /**
+     * An unset variable is left in the config verbatim rather than throwing or expanding to an
+     * empty string. The plugin then fails to connect with a literal {@code ${...}} where the host
+     * should be, which names its own cause — an empty string would not.
+     */
     @Test
-    void unsetVariableFailsAndNamesIt(@TempDir Path dir) throws IOException {
+    void unsetVariableIsLeftAsWritten(@TempDir Path dir) throws IOException {
         Path config = write(dir, COMPLETE_CONFIG.replace("${SR_TEST_HOST}", "${SR_TEST_DEFINITELY_UNSET}"));
 
-        ConfigMeException thrown = assertThrows(ConfigMeException.class,
-                () -> load(config, new ArrayList<>()));
+        SettingsManager settings = load(config, new ArrayList<>());
 
-        assertTrue(thrown.getMessage().contains("SR_TEST_DEFINITELY_UNSET"),
-                "the message must name the variable, got: " + thrown.getMessage());
+        assertEquals("${SR_TEST_DEFINITELY_UNSET}", settings.getProperty(DatabaseConfig.DATABASE_HOST));
+    }
+
+    /** A fallback chain: the plugin's own variable first, the shared one behind it. */
+    @Test
+    void nestedFallbackResolvesToTheInnerVariable(@TempDir Path dir) throws IOException {
+        Path config = write(dir, COMPLETE_CONFIG.replace(
+                "${SR_TEST_HOST}", "${SR_TEST_UNSET_HOST:-${SR_TEST_HOST:-localhost}}"));
+
+        SettingsManager settings = load(config, new ArrayList<>());
+
+        assertEquals(HOST, settings.getProperty(DatabaseConfig.DATABASE_HOST));
     }
 
     @Test
@@ -141,20 +178,42 @@ class EnvConfigTest {
         assertTrue(warnings.isEmpty());
     }
 
+    /**
+     * The substitution rules themselves, stated once. They are the XMine Paper fork's, and a
+     * divergence here would mean two dialects on one server — which is the thing this port exists
+     * to remove.
+     */
     @Test
-    void strictConstructorOnlyTightensTheBareForm() {
-        StrictEnvScalarConstructor constructor = new StrictEnvScalarConstructor();
+    void substitutionRulesMatchTheCoreDialect() {
+        UnaryOperator<String> env = name -> switch (name) {
+            case "SET" -> "value";
+            case "EMPTY" -> "";
+            case "INDIRECT" -> "${SET}";
+            default -> null;
+        };
 
-        // Bare ${VAR}: unset or empty is an error, a value passes through.
-        assertThrows(RuntimeException.class, () -> constructor.apply("VAR", null, "", null));
-        assertThrows(RuntimeException.class, () -> constructor.apply("VAR", null, "", ""));
-        assertEquals("value", constructor.apply("VAR", null, "", "value"));
+        // Expansion, and the two ways of asking for a default.
+        assertEquals("value", EnvironmentSubstitutor.substitute("${SET}", env));
+        assertEquals("value", EnvironmentSubstitutor.substitute("${UNSET:-${SET}}", env));
+        assertEquals("fallback", EnvironmentSubstitutor.substitute("${UNSET:-fallback}", env));
+        assertEquals("fallback", EnvironmentSubstitutor.substitute("${EMPTY:-fallback}", env),
+                "an empty value counts as unset, as in the shell");
+        assertEquals("", EnvironmentSubstitutor.substitute("${EMPTY}", env));
 
-        // The explicit forms keep SnakeYAML's own semantics.
-        assertEquals("fallback", constructor.apply("VAR", ":-", "fallback", null));
-        assertEquals("fallback", constructor.apply("VAR", ":-", "fallback", ""));
-        assertEquals("value", constructor.apply("VAR", ":-", "fallback", "value"));
-        assertEquals("fallback", constructor.apply("VAR", "-", "fallback", null));
+        // Nothing to expand: the caller keeps the original scalar, tag and all.
+        assertNull(EnvironmentSubstitutor.substitute("plain text", env));
+
+        // Everything ambiguous is left exactly as written.
+        assertNull(EnvironmentSubstitutor.substitute("${UNSET}", env), "an unset variable stays put");
+        assertNull(EnvironmentSubstitutor.substitute("${lower_case}", env), "not an env var name");
+        assertNull(EnvironmentSubstitutor.substitute("${UNTERMINATED", env));
+        assertEquals("${SET}", EnvironmentSubstitutor.substitute("$${SET}", env), "$$ escapes");
+        assertEquals("${SET}", EnvironmentSubstitutor.substitute("${INDIRECT}", env),
+                "a substituted value is never rescanned");
+
+        // Surrounding text survives, and a value can carry several references.
+        assertEquals("jdbc:mysql://value:3306/", EnvironmentSubstitutor.substitute(
+                "jdbc:mysql://${SET}:${UNSET:-3306}/", env));
     }
 
     private static SettingsManager load(Path config, List<String> warnings) {

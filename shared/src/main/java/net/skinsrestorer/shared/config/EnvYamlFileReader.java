@@ -21,10 +21,16 @@ import ch.jalu.configme.exception.ConfigMeException;
 import ch.jalu.configme.resource.YamlFileReader;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
-import org.yaml.snakeyaml.env.EnvScalarConstructor;
-import org.yaml.snakeyaml.error.MissingEnvironmentVariableException;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
 import org.yaml.snakeyaml.error.YAMLException;
+import org.yaml.snakeyaml.nodes.MappingNode;
+import org.yaml.snakeyaml.nodes.Node;
+import org.yaml.snakeyaml.nodes.NodeTuple;
+import org.yaml.snakeyaml.nodes.ScalarNode;
+import org.yaml.snakeyaml.nodes.SequenceNode;
+import org.yaml.snakeyaml.nodes.Tag;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -33,34 +39,45 @@ import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
-// XMine start - подстановка переменных окружения в config.yml
+// XMine start - подстановка переменных среды
 /**
- * A {@link YamlFileReader} that resolves environment variables while parsing.
+ * A {@link YamlFileReader} that expands environment variable references while parsing.
  *
- * <p>The only difference from the parent is the SnakeYAML constructor: {@link EnvScalarConstructor}
- * instead of the default one. It acts on scalars tagged {@code !ENV} and on nothing else, so an
- * untagged {@code ${...}} stays a literal string and existing configs keep parsing byte for byte
- * the same way:
+ * <p>The rules are {@link EnvironmentSubstitutor}'s, which are the XMine Paper fork's: every plugin
+ * config on a game node behaves the same way, whether the plugin reads it through Bukkit or, like
+ * this one, through ConfigMe.
  *
  * <pre>{@code
  * database:
- *   password: !ENV ${SR_MYSQL_PASSWORD}          # required: unset or empty stops the start-up
- *   database: !ENV ${SR_MYSQL_DATABASE:-skins}   # default if unset or empty
+ *   host: ${DATABASE_HOST}                                  # left as written if unset
+ *   port: ${SKINSRESTORER_DATABASE_PORT:-${DATABASE_PORT}}  # nested fallback
+ *   database: ${SKINSRESTORER_DATABASE_DATABASE:-skins}     # literal fallback
  * }</pre>
  *
- * <p>The constructor is {@link StrictEnvScalarConstructor}, not the stock one: a bare
- * {@code ${VAR}} that stock SnakeYAML would resolve to an empty string is an error here.
+ * <p>No tag is needed. An earlier version of this class used SnakeYAML's own
+ * {@code EnvScalarConstructor}, which acts only on scalars tagged {@code !ENV}; that meant a second
+ * substitution dialect on the same server - different syntax, no nesting, and every value arriving
+ * as a String.
  *
- * <p>Note the types. An {@code !ENV} scalar always yields a <em>String</em>, and ConfigMe accepts a
- * String only for string and enum properties — an integer or boolean property fed from {@code !ENV}
- * counts as invalid in the resource, which makes ConfigMe rewrite the whole file. Keep numbers and
- * booleans (for example {@code database.port}) as literals.
+ * <h2>Quoting decides the type</h2>
+ * Substitution runs on the parsed node tree, not on the file's text, so an unquoted
+ * {@code port: ${DATABASE_PORT}} arrives as a real {@link Integer} and ConfigMe's integer property
+ * takes it. A quoted {@code port: "${DATABASE_PORT}"} stays a String, and ConfigMe then rejects it
+ * for a numeric property, falls back to the default and counts the resource as incomplete - so
+ * leave references to numeric and boolean settings unquoted. Only values that survive a round trip
+ * unchanged are retyped: {@code 5432} is, {@code 0755} is not.
  *
- * <p>Resolution happens on read only. {@link ch.jalu.configme.resource.YamlFileResource} writing is
- * inherited untouched, but be aware that if SkinsRestorer ever exports the config (a migration),
- * the resolved values — the real password — would be written to disk.
+ * <p>Keys are never substituted: a key is a path segment, and rewriting one would move the value
+ * somewhere ConfigMe does not look.
+ *
+ * <p>Resolution happens on read only. Writing is inherited from ConfigMe untouched - which matters
+ * because this fork also removes the config write-back: were it still there, the expanded values,
+ * the real password among them, would be written to disk on the first version bump.
  */
 public class EnvYamlFileReader extends YamlFileReader {
 
@@ -83,12 +100,15 @@ public class EnvYamlFileReader extends YamlFileReader {
 
         try (InputStream is = Files.newInputStream(path);
              Reader reader = new InputStreamReader(is, StandardCharsets.UTF_8)) {
-            Map<Object, Object> rootMap = new Yaml(new StrictEnvScalarConstructor()).load(reader);
+            // Parsing is split into compose and construct on purpose: substitution has to run on the
+            // node tree, where a scalar still knows whether it was quoted - and that is what decides
+            // the type an expanded value arrives as.
+            Node document = new Yaml(new LoaderOptions()).compose(reader);
+            @SuppressWarnings("unchecked")
+            Map<Object, Object> rootMap = document == null
+                    ? null
+                    : (Map<Object, Object>) new SubstitutingConstructor().construct(document);
             return normalizeMap(rootMap, splitDotPaths);
-        } catch (MissingEnvironmentVariableException e) {
-            // Wrapped by hand so the reason - which variable - survives into the top-level message.
-            // ConfigMe's generic YAMLException branch would only say "YAML error while loading".
-            throw new ConfigMeException("Cannot read '" + path + "': " + e.getMessage(), e);
         } catch (IOException e) {
             throw new ConfigMeException("Could not read file '" + path + "'", e);
         } catch (ClassCastException e) {
@@ -97,5 +117,90 @@ public class EnvYamlFileReader extends YamlFileReader {
             throw new ConfigMeException("YAML error while trying to load file '" + path + "'", e);
         }
     }
+
+    /**
+     * Rewrites the composed node tree before construction, expanding every scalar value.
+     */
+    private static final class SubstitutingConstructor extends SafeConstructor {
+
+        /**
+         * A decimal integer whose {@code toString} is byte-for-byte what was read. Anything else -
+         * {@code 0755}, {@code 1_000}, {@code 0x1F}, {@code -0} - stays a string: YAML 1.1 would
+         * turn {@code 0755} into 493, and a value written back would no longer be the one supplied.
+         */
+        private static final Pattern CANONICAL_INT = Pattern.compile("0|-?[1-9][0-9]*");
+        private static final Pattern CANONICAL_FLOAT = Pattern.compile("-?(?:0|[1-9][0-9]*)\\.[0-9]+");
+
+        private SubstitutingConstructor() {
+            super(new LoaderOptions());
+        }
+
+        /**
+         * Expands the tree and builds the document from it.
+         *
+         * <p>{@code constructDocument} is final in SnakeYAML, so the expansion cannot be hooked into
+         * construction - it happens here, before it.
+         */
+        private @Nullable Object construct(@NotNull Node document) {
+            return constructDocument(substitute(document));
+        }
+
+        private static @NotNull Node substitute(@NotNull Node node) {
+            if (node instanceof MappingNode mapping) {
+                // NodeTuple is immutable, so a mapping is rebuilt rather than patched in place.
+                List<NodeTuple> tuples = new ArrayList<>(mapping.getValue().size());
+                for (NodeTuple tuple : mapping.getValue()) {
+                    // Keys are never substituted: a key is a path segment, and rewriting one would
+                    // move the value somewhere ConfigMe does not look for it.
+                    tuples.add(new NodeTuple(tuple.getKeyNode(), substitute(tuple.getValueNode())));
+                }
+                mapping.setValue(tuples);
+                return mapping;
+            }
+
+            if (node instanceof SequenceNode sequence) {
+                // SequenceNode has no setter for its value: the list itself is patched.
+                List<Node> values = sequence.getValue();
+                for (int index = 0; index < values.size(); index++) {
+                    values.set(index, substitute(values.get(index)));
+                }
+                return sequence;
+            }
+
+            if (!(node instanceof ScalarNode scalar)) {
+                return node;
+            }
+
+            String substituted = EnvironmentSubstitutor.substitute(scalar.getValue(), System::getenv);
+            if (substituted == null) {
+                return node;
+            }
+
+            Tag tag = scalar.isPlain() && Tag.STR.equals(scalar.getTag())
+                    ? implicitTag(substituted)
+                    : scalar.getTag();
+            return new ScalarNode(tag, substituted, scalar.getStartMark(), scalar.getEndMark(), scalar.getScalarStyle());
+        }
+
+        /**
+         * Resolves the implicit YAML tag of an expanded scalar, but only where the value survives a
+         * round trip unchanged. Everything else stays a string.
+         */
+        private static @NotNull Tag implicitTag(@NotNull String value) {
+            if (value.isEmpty()) {
+                return Tag.STR; // an empty expansion is an empty string, not null
+            }
+            if (CANONICAL_INT.matcher(value).matches()) {
+                return Tag.INT;
+            }
+            if (value.equals("true") || value.equals("false")) {
+                return Tag.BOOL; // not "yes"/"on": those would come back as "true" on the next save
+            }
+            if (CANONICAL_FLOAT.matcher(value).matches()) {
+                return Tag.FLOAT;
+            }
+            return Tag.STR;
+        }
+    }
 }
-// XMine end - подстановка переменных окружения в config.yml
+// XMine end - подстановка переменных среды
