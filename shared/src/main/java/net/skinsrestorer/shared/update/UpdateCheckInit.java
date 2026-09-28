@@ -42,7 +42,11 @@ public class UpdateCheckInit {
         boolean downloaderDisabled = Files.exists(plugin.getDataFolder().resolve("noautoupdate.txt"))
                 || Files.exists(plugin.getDataFolder().resolve("noupdate.txt")); // Legacy support
         if (downloaderDisabled) {
-            logger.info("Auto updater was manually disabled. This is not recommended, as it will prevent the plugin from updating automatically. See why at: https://skinsrestorer.net/docs/configuration/auto-update");
+            // XMine start - маркер noautoupdate.txt кладёт образ намеренно: плагин
+            // обновляется сменой координаты в образе, а не сам. Напоминание об этом
+            // на каждом старте каждой ноды и прокси — только шум в логах.
+            logger.debug("Auto updater was manually disabled. This is not recommended, as it will prevent the plugin from updating automatically. See why at: https://skinsrestorer.net/docs/configuration/auto-update");
+            // XMine end - маркер noautoupdate.txt кладёт образ намеренно
         }
 
         DownloaderClassProvider downloaderClassProvider = injector.getIfAvailable(DownloaderClassProvider.class);
