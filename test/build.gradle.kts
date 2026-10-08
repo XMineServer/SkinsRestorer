@@ -16,3 +16,16 @@ dependencies {
 
     testRuntimeOnly(libs.slf4j.simple)
 }
+
+// XMine start - окружение для EnvConfigTest
+//
+// EnvConfigTest проверяет подстановку !ENV ${...} и то, что конфиг не переписывается.
+// Переменные окружения из JVM не подделать, поэтому их задаёт сама задача.
+tasks.test {
+    environment("SR_TEST_HOST", "db.internal.example")
+    environment("SR_TEST_DATABASE", "skins")
+    environment("SR_TEST_USERNAME", "sruser")
+    environment("SR_TEST_PASSWORD", "s3cr3t-must-not-reach-disk")
+    environment("SR_TEST_PORT", "3307")
+}
+// XMine end - окружение для EnvConfigTest

@@ -133,7 +133,20 @@ public class SRPlugin {
         SettingsManager settings = injector.getIfAvailable(SettingsManager.class);
         if (settings == null) {
             settings = SettingsManagerBuilder
-                    .withYamlFile(dataFolder.resolve("config.yml"))
+                    // XMine start - подстановка переменных окружения в config.yml
+                    //
+                    // Было: .withYamlFile(dataFolder.resolve("config.yml")).
+                    //
+                    // EnvYamlFileResource отличается от YamlFileResource двумя вещами:
+                    //   * при ЧТЕНИИ скаляры с тегом !ENV раскрываются из окружения - ради этого
+                    //     всё и затевалось, реквизиты MySQL приезжают в прокси переменными, а не
+                    //     лежат в config.yml внутри образа;
+                    //   * ЗАПИСЬ поверх непустого файла запрещена. Иначе первый же ключ, который
+                    //     появится в новой версии плагина, заставил бы ConfigMe переписать конфиг
+                    //     уже разрешёнными значениями - и пароль лёг бы в файл открытым текстом.
+                    //     Проверено экспериментом, одного отсутствующего ключа достаточно.
+                    .withResource(new EnvYamlFileResource(dataFolder.resolve("config.yml"), logger::warning))
+                    // XMine end - подстановка переменных окружения в config.yml
                     .configurationData(
                             CommentsConfig.class,
                             MessageConfig.class,

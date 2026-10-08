@@ -10,7 +10,23 @@ tasks.named<UpdateDaemonJvm>("updateDaemonJvm") {
 
 allprojects {
     group = "net.skinsrestorer"
-    version = property("maven_version")!!
+    // XMine start - своя версия
+    //
+    // Суффикс не косметика: наш jar лежит в своём Reposilite и по внешнему виду
+    // неотличим от апстримного. Версия - единственное, что говорит, какая сборка
+    // стоит на прокси, и она же видна в /sr info и в логе запуска.
+    //
+    // В CI это адрес сборки <maven_version>-<ветка>-<дата>-<хеш> (вики, ADR-0056):
+    // его считает .github/workflows/xmine-publish.yml и передаёт -PxmineVersion.
+    // Локальная сборка без -P получает -xmine-local и не спутается с опубликованной.
+    // maven_version остаётся ровно апстримным, чтобы перенос правок на новый тег
+    // не упирался в конфликт по этой строке.
+    //
+    // Апстримному апдейт-чекеру суффикс не мешает: SemanticVersion.fromString
+    // обрезает строку на первом не-цифре и не-точке, то есть видит ровно 15.12.5.
+    version = providers.gradleProperty("xmineVersion")
+        .getOrElse("${property("maven_version")}-xmine-local")
+    // XMine end - своя версия
     description = "Ability to restore/change skins on servers!"
 
     repositories {
