@@ -11,6 +11,11 @@
 #
 # Отсюда же остальные меры: триггера `pull_request` нет вовсе, push ограничен
 # нашими ветками, а job не запускается в форках самого форка.
+#
+# Координата - адрес сборки <апстрим>-<ветка>-<ГГГГ-ММ-ДД>-<хеш> в разделе-
+# кандидате пары форков `fork-snapshot` (вики, ADR-0056), как у HuskSync и Sonar.
+# Публикуется любая ветка `xmine/**`, но закрепляться в XMineNode и VelocityServer
+# можно только на координату с `xmine/main` (ADR-0060): в версии это `…-xmine-main-…`.
 
 name: XMine - publish SkinsRestorer
 
@@ -27,6 +32,15 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  MAVEN_GROUP_PATH: ru/xmine/thirdparty
+  MAVEN_ARTIFACT: skinsrestorer
+  # Раздел-кандидат пары форков, а не third-party: third-party - зеркало ЧУЖИХ
+  # артефактов, а сборку форка правим и собираем мы, поэтому у неё есть стадия.
+  MAVEN_SECTION: fork-snapshot
+  # Имя файла задаёт universal/build.gradle.kts (shadeDowngradedApi.archiveFileName)
+  JAR: build/libs/SkinsRestorer.jar
 
 jobs:
   publish:
@@ -50,6 +64,23 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Версия
+        # Считается из коммита, а не берётся из константы: координата обязана
+        # различать сборки. Апстримная часть - maven_version из gradle.properties
+        # (её ведёт апстрим, поэтому вручную здесь ничего не задаётся). `/` в имени
+        # ветки заменяется на `-` - в версии Maven это разделитель пути в раскладке
+        # репозитория, и артефакт уехал бы не туда.
+        run: |
+          set -eu
+          upstream=$(sed -n 's/^maven_version=//p' gradle.properties)
+          if [ -z "$upstream" ]; then
+            echo "::error::maven_version is missing from gradle.properties"
+            exit 1
+          fi
+          branch=$(printf '%s' "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" | tr -c 'A-Za-z0-9.' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
+          read -r cdate chash < <(git log -1 --format='%cs %h')
+          echo "XMINE_VERSION=${upstream}-${branch}-${cdate}-${chash}" >> "$GITHUB_ENV"
+
       - name: Fail early without credentials
         run: |
           # Без учётки сборка дошла бы до конца и упала на последнем шаге.
@@ -59,7 +90,27 @@ jobs:
             exit 1
           fi
 
+      - name: Занята ли координата
+        id: exists
+        # Координата неизменяема, поэтому «уже опубликовано» - законный ответ, а не
+        # ошибка. Коды различаются намеренно: 404 - публиковать, 200 - пропустить,
+        # всё остальное - падать. 401 при неверном имени секрета иначе выглядел бы
+        # как «артефакта нет».
+        run: |
+          set -eu
+          BASE="https://maven.xmine.world/${MAVEN_SECTION}/${MAVEN_GROUP_PATH}/${MAVEN_ARTIFACT}/${XMINE_VERSION}"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+                   --user "${XMINE_MAVEN_USERNAME}:${XMINE_MAVEN_PASSWORD}" \
+                   "${BASE}/${MAVEN_ARTIFACT}-${XMINE_VERSION}.pom")
+          case "$CODE" in
+            404) echo "found=false" >> "$GITHUB_OUTPUT"; echo "Публикуем ${XMINE_VERSION}" ;;
+            200) echo "found=true"  >> "$GITHUB_OUTPUT"
+                 echo "${XMINE_VERSION} уже в разделе ${MAVEN_SECTION} - собирать нечего" ;;
+            *)   echo "::error::${BASE} ответил $CODE - это не «есть» и не «нет»"; exit 1 ;;
+          esac
+
       - name: Test
+        if: steps.exists.outputs.found == 'false'
         # Только свои тесты. Остальной набор в этом модуле поднимает MariaDB и
         # PostgreSQL через testcontainers - это не то, что должно решать, публикуем
         # ли мы плагин, и не то, что стоит держать в зависимости от чужого Docker Hub.
@@ -67,23 +118,56 @@ jobs:
         # EnvConfigTest - единственное, что отделяет сломанный конфиг от публикации:
         # он проверяет и подстановку !ENV, и то, что конфиг не переписывается
         # разрешёнными значениями (пароль открытым текстом на диск).
-        run: ./gradlew -PxmineSkipMods=true :test:test --tests 'net.skinsrestorer.config.*' --stacktrace
+        run: ./gradlew -PxmineSkipMods=true -PxmineVersion="${XMINE_VERSION}" :test:test --tests 'net.skinsrestorer.config.*' --stacktrace
 
       - name: Build universal jar
-        # Тот самый один-на-все-платформы SkinsRestorer.jar, который едет на прокси.
-        run: ./gradlew -PxmineSkipMods=true :skinsrestorer:shadeDowngradedApi --stacktrace
+        if: steps.exists.outputs.found == 'false'
+        # Тот самый один-на-все-платформы SkinsRestorer.jar, который едет на прокси и ноды.
+        run: ./gradlew -PxmineSkipMods=true -PxmineVersion="${XMINE_VERSION}" :skinsrestorer:shadeDowngradedApi --stacktrace
 
-      - name: Publish
-        run: ./gradlew -PxmineSkipMods=true :skinsrestorer:publishXmineUniversalPublicationToXmineRepository --stacktrace
-
-      - name: Report coordinate
+      - name: Publish to Reposilite
+        if: steps.exists.outputs.found == 'false'
+        # maven-publish кладёт рядом с jar сгенерированный pom - без него координата
+        # неполна, и резолвер на той стороне спотыкается.
         run: |
-          VERSION="$(./gradlew -q --console=plain -PxmineSkipMods=true :skinsrestorer:printXmineVersion | tail -1)"
-          SHA="$(sha256sum build/libs/SkinsRestorer.jar | cut -d' ' -f1)"
+          XMINE_MAVEN_URL="https://maven.xmine.world/${MAVEN_SECTION}" \
+            ./gradlew -PxmineSkipMods=true -PxmineVersion="${XMINE_VERSION}" \
+            :skinsrestorer:publishXmineUniversalPublicationToXmineRepository --stacktrace
+
+      - name: Verify the way XMineNode and VelocityServer will fetch it
+        if: steps.exists.outputs.found == 'false'
+        # Сверка идёт ровно тем путём, которым пойдёт сборка образа: качаем по прямому
+        # адресу и сличаем хеш. Без этого «опубликовано» означает лишь «сервер ответил 2xx».
+        run: |
+          set -eu
+          BASE="https://maven.xmine.world/${MAVEN_SECTION}/${MAVEN_GROUP_PATH}/${MAVEN_ARTIFACT}/${XMINE_VERSION}"
+          curl --fail-with-body --silent --show-error \
+               --user "${XMINE_MAVEN_USERNAME}:${XMINE_MAVEN_PASSWORD}" \
+               -o /tmp/roundtrip.jar "${BASE}/${MAVEN_ARTIFACT}-${XMINE_VERSION}.jar"
+
+          LOCAL="$(sha256sum "${JAR}" | cut -d' ' -f1)"
+          REMOTE="$(sha256sum /tmp/roundtrip.jar | cut -d' ' -f1)"
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "::error::Round-trip mismatch: local $LOCAL, published $REMOTE"
+            exit 1
+          fi
+
           {
             echo "### Published"
             echo '```'
-            echo "ru.xmine.thirdparty:skinsrestorer:$VERSION"
-            echo "sha256: $SHA"
+            echo "$(echo "${MAVEN_GROUP_PATH}" | tr '/' '.'):${MAVEN_ARTIFACT}:${XMINE_VERSION}"
+            echo "repo:        ${MAVEN_SECTION}"
+            echo "sha256:      ${LOCAL}"
+            echo "base commit: ${GITHUB_SHA}"
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Уже опубликовано
+        if: steps.exists.outputs.found == 'true'
+        run: |
+          {
+            echo "### Ничего не публиковалось"
+            echo
+            echo "\`${XMINE_VERSION}\` уже лежит в разделе \`${MAVEN_SECTION}\`:"
+            echo "входы этой сборки с прошлой публикации не менялись."
           } >> "$GITHUB_STEP_SUMMARY"

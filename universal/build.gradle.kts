@@ -90,8 +90,9 @@ hangarPublish {
 // один на все платформы. Подпроектные публикации из sr.base-logic (api, shared, ...) нас
 // не касаются - мы их не заливаем.
 //
-// Раздел жёстко third-party: это зеркало чужих плагинов, и наш форк лежит там же, рядом
-// с апстримным skinsrestorer:15.12.5, отличаясь только версией.
+// Раздел - кандидат пары форков fork-snapshot (вики, ADR-0056), а не third-party:
+// third-party - зеркало ЧУЖИХ артефактов, а сборку форка правим и собираем мы.
+// Workflow передаёт полный адрес раздела через XMINE_MAVEN_URL.
 publishing {
     publications {
         register<MavenPublication>("xmineUniversal") {
@@ -129,9 +130,10 @@ publishing {
         // локально ~/.gradle/gradle.properties, в CI - переменные окружения.
         maven {
             name = "xmine"
-            val base = providers.gradleProperty("xmineMavenUrl")
-                .getOrElse("https://maven.xmine.world")
-            url = uri("$base/third-party")
+            url = uri(
+                providers.environmentVariable("XMINE_MAVEN_URL")
+                    .getOrElse("https://maven.xmine.world/fork-snapshot")
+            )
             credentials {
                 username = providers.gradleProperty("xmineMavenUsername")
                     .orElse(providers.environmentVariable("XMINE_MAVEN_USERNAME"))
@@ -148,12 +150,5 @@ publishing {
 // которая этот файл делает, объявляется здесь явно.
 tasks.withType<AbstractPublishToMaven>().configureEach {
     dependsOn(tasks.shadeDowngradedApi)
-}
-
-tasks.register("printXmineVersion") {
-    val v = project.version.toString()
-    doLast {
-        println(v)
-    }
 }
 // XMine end - публикация универсального jar в свой Reposilite
